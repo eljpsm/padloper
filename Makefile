@@ -1,0 +1,33 @@
+.PHONY: build install test test-cli coverage coverage-html lint fmt
+
+# Build the release binary.
+build:
+	cargo build --release
+
+# Install padloper onto PATH (~/.cargo/bin).
+install:
+	cargo install --path .
+
+# Run everything: unit + CLI.
+test:
+	cargo test
+
+# End-to-end binary tests (exit codes, db handling).
+test-cli:
+	cargo test --test cli
+
+# Line and region coverage across all tests, printed per file.
+coverage:
+	cargo llvm-cov --all-targets
+
+# Same, rendered as an annotated HTML report.
+coverage-html:
+	cargo llvm-cov --all-targets --open
+
+# Clippy across all targets; warnings fail, locally and in CI alike.
+lint:
+	cargo clippy --all-targets -- --deny warnings
+
+# Format the Rust source.
+fmt:
+	cargo fmt
