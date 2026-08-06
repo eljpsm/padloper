@@ -1,11 +1,8 @@
 # padloper
 
-A minimalist sqlite-backed shell-history recorder and searcher. A tiny atuin,
-after [stinkpot](https://tangled.org/oppi.li/stinkpot).
-
-Shell hooks record every command you run. Ctrl+r opens a fuzzy searcher and puts
-the pick back on your prompt line. One row per distinct command, newest first.
-No configuration.
+A minimalist sqlite-backed shell-history recorder and searcher. A tiny
+[atuin](https://github.com/atuinsh/atuin), after
+[stinkpot](https://tangled.org/oppi.li/stinkpot).
 
 ## Install
 
