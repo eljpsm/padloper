@@ -10,8 +10,13 @@ No configuration.
 ## Install
 
 ```bash
+# Straight from GitHub:
 cargo install --git https://github.com/eljpsm/padloper
+
+# With Nix:
 nix run github:eljpsm/padloper
+
+# From a clone (installs to ~/.cargo/bin):
 make install
 ```
 
@@ -96,6 +101,13 @@ flowchart TD
 
 History lives in `$XDG_DATA_HOME/padloper/history.db`, or
 `~/.local/share/padloper/history.db`.
+
+## Acknowledgements
+
+passdown is inspired by:
+
+- [atuin](https://github.com/atuinsh/atuin)
+- [stinkpot](https://tangled.org/oppi.li/stinkpot)
 
 ## License
 
