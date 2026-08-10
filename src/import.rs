@@ -8,49 +8,13 @@
 //! it understood. A partial import looks like a complete one, and the
 //! command that got dropped is the one you go looking for later.
 
-use std::fmt;
 use std::path::{Path, PathBuf};
 
+use anyhow::{Context, anyhow, bail};
 use rusqlite::{Connection, OpenFlags};
 
-use crate::db::{Db, DbError, Observation};
+use crate::db::{Db, Observation};
 use crate::timefmt::unix_now;
-
-/// `NoSource` means no atuin db, no HISTFILE, and no history file for
-/// $SHELL. `Format` means the file was read but does not hold the format
-/// detection said it did.
-#[derive(Debug)]
-pub enum ImportError {
-    NoSource,
-    Read { path: PathBuf, message: String },
-    Format { path: PathBuf, message: String },
-    Atuin { path: PathBuf, message: String },
-    Db(DbError),
-}
-
-impl fmt::Display for ImportError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ImportError::NoSource => {
-                write!(f, "nothing to import: no atuin db and no history file")
-            }
-            ImportError::Read { path, message } => {
-                write!(f, "cannot read {}: {message}", path.display())
-            }
-            ImportError::Format { path, message } => {
-                write!(f, "cannot parse {}: {message}", path.display())
-            }
-            ImportError::Atuin { path, message } => {
-                write!(
-                    f,
-                    "cannot read the atuin db at {}: {message}",
-                    path.display()
-                )
-            }
-            ImportError::Db(e) => e.fmt(f),
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Format {
@@ -71,8 +35,11 @@ enum Source {
 
 /// Import into `db` and report how many rows were written. Safe to run more
 /// than once: [`crate::db::Db::observe_all`] merges rather than appends.
-pub fn run(db: &mut Db) -> Result<u64, ImportError> {
-    let mut rows = match locate_source()? {
+pub fn run(db: &mut Db) -> anyhow::Result<u64> {
+    let Some(source) = locate_source() else {
+        bail!("nothing to import: no atuin db and no history file");
+    };
+    let mut rows = match source {
         Source::Atuin(path) => read_atuin(&path)?,
         Source::Text { path, format } => read_text(&path, format)?,
     };
@@ -81,24 +48,26 @@ pub fn run(db: &mut Db) -> Result<u64, ImportError> {
     // order when timestamps tie, which is the best evidence available for
     // history that carries no timestamps at all.
     rows.sort_by_key(|row| row.ts);
-    db.observe_all(rows).map_err(ImportError::Db)
+    db.observe_all(rows)
 }
 
-/// Pick where to import from. Atuin wins, then HISTFILE, then the default
-/// history file for $SHELL. The README states this order; keep them in step.
+/// Pick where to import from, or `None` when there is no atuin db, no
+/// HISTFILE, and no history file for $SHELL. Atuin wins, then HISTFILE, then
+/// the default history file for $SHELL. The README states this order; keep
+/// them in step.
 ///
 /// The choice is final. Once a source is picked, failing to read it is an
 /// error, not a reason to try the next one: importing some other shell's
 /// history because the chosen file was missing would be worse than failing.
-fn locate_source() -> Result<Source, ImportError> {
+fn locate_source() -> Option<Source> {
     if let Ok(dir) = crate::db::data_dir() {
         let atuin = dir.join("atuin").join("history.db");
         if atuin.exists() {
-            return Ok(Source::Atuin(atuin));
+            return Some(Source::Atuin(atuin));
         }
     }
     if let Some(histfile) = nonempty_env("HISTFILE") {
-        return Ok(Source::Text {
+        return Some(Source::Text {
             path: histfile.into(),
             format: Format::Detect,
         });
@@ -112,8 +81,7 @@ fn locate_source() -> Result<Source, ImportError> {
         Some("fish") => fish_source(),
         // Zsh has no default history path. Guessing one risks importing
         // some other shell's file, so ask for HISTFILE instead.
-        Some("zsh") => Err(ImportError::NoSource),
-        Some("bash") => home_source(".bash_history", Format::Bash),
+        Some("zsh") => None,
         // An unset or unrecognized SHELL is most often bash.
         _ => home_source(".bash_history", Format::Bash),
     }
@@ -123,45 +91,32 @@ fn nonempty_env(name: &str) -> Option<std::ffi::OsString> {
     std::env::var_os(name).filter(|value| !value.is_empty())
 }
 
-fn home_source(name: &str, format: Format) -> Result<Source, ImportError> {
-    let Some(home) = nonempty_env("HOME") else {
-        return Err(ImportError::NoSource);
-    };
+fn home_source(name: &str, format: Format) -> Option<Source> {
+    let home = nonempty_env("HOME")?;
     existing_source(PathBuf::from(home).join(name), format)
 }
 
-fn fish_source() -> Result<Source, ImportError> {
+fn fish_source() -> Option<Source> {
     // Default history location:
     // https://fishshell.com/docs/current/interactive.html#searchable-command-history
-    let Ok(data) = crate::db::data_dir() else {
-        return Err(ImportError::NoSource);
-    };
+    let data = crate::db::data_dir().ok()?;
     existing_source(data.join("fish").join("fish_history"), Format::Fish)
 }
 
-fn existing_source(path: PathBuf, format: Format) -> Result<Source, ImportError> {
-    if path.exists() {
-        Ok(Source::Text { path, format })
-    } else {
-        Err(ImportError::NoSource)
-    }
+fn existing_source(path: PathBuf, format: Format) -> Option<Source> {
+    path.exists().then_some(Source::Text { path, format })
 }
 
-fn read_text(path: &Path, requested: Format) -> Result<Vec<Observation>, ImportError> {
+fn read_text(path: &Path, requested: Format) -> anyhow::Result<Vec<Observation>> {
     // Shell history files can hold arbitrary bytes, so decode lossily.
-    let bytes = std::fs::read(path).map_err(|e| ImportError::Read {
-        path: path.to_path_buf(),
-        message: e.to_string(),
-    })?;
+    let bytes = std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
     let text = String::from_utf8_lossy(&bytes);
     let format = match requested {
         Format::Detect => detect_format(&text),
         format => format,
     };
-    parse_text(&text, format, unix_now()).map_err(|message| ImportError::Format {
-        path: path.to_path_buf(),
-        message,
-    })
+    parse_text(&text, format, unix_now())
+        .map_err(|message| anyhow!("cannot parse {}: {message}", path.display()))
 }
 
 /// Guess a format from the first non-blank line. Only Zsh and Fish are
@@ -377,20 +332,17 @@ fn push_observation(out: &mut Vec<Observation>, cmd: &str, ts: i64) {
 ///
 /// Atuin stores nanoseconds and blanks deleted commands, so scale down and
 /// skip tombstones. Opened read-only, since atuin may be running.
-fn read_atuin(path: &Path) -> Result<Vec<Observation>, ImportError> {
-    let atuin_err = |message: String| ImportError::Atuin {
-        path: path.to_path_buf(),
-        message,
-    };
+fn read_atuin(path: &Path) -> anyhow::Result<Vec<Observation>> {
+    let atuin_context = || format!("cannot read the atuin db at {}", path.display());
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|e| atuin_err(e.to_string()))?;
+        .with_context(atuin_context)?;
     let mut stmt = conn
         .prepare(
             "select command, cwd, exit, timestamp / 1000000000, session
              from history where deleted_at is null
              order by timestamp, id",
         )
-        .map_err(|e| atuin_err(e.to_string()))?;
+        .with_context(atuin_context)?;
     let rows = stmt
         .query_map([], |r| {
             Ok(Observation {
@@ -401,9 +353,9 @@ fn read_atuin(path: &Path) -> Result<Vec<Observation>, ImportError> {
                 session: r.get(4)?,
             })
         })
-        .map_err(|e| atuin_err(e.to_string()))?;
+        .with_context(atuin_context)?;
     rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|e| atuin_err(e.to_string()))
+        .with_context(atuin_context)
 }
 
 // The parsers run against real history files exactly once per machine, and
@@ -526,59 +478,36 @@ mod tests {
     }
 
     // Import failures point at a file the user can go look at, so every
-    // variant has to carry its path into the message. Db defers to DbError
-    // rather than adding a second prefix.
-    #[test]
-    fn import_errors_keep_their_source() {
-        assert_eq!(
-            ImportError::Read {
-                path: "/tmp/hist".into(),
-                message: "denied".into(),
-            }
-            .to_string(),
-            "cannot read /tmp/hist: denied"
-        );
-        assert_eq!(
-            ImportError::Format {
-                path: "/tmp/hist".into(),
-                message: "bad record".into(),
-            }
-            .to_string(),
-            "cannot parse /tmp/hist: bad record"
-        );
-        assert_eq!(
-            ImportError::Atuin {
-                path: "/tmp/atuin.db".into(),
-                message: "bad schema".into(),
-            }
-            .to_string(),
-            "cannot read the atuin db at /tmp/atuin.db: bad schema"
-        );
-        assert_eq!(
-            ImportError::Db(DbError::Query("stopped".into())).to_string(),
-            "database error: stopped"
-        );
-    }
-
-    // The two ways reading a history file fails, told apart by variant so
-    // the message says which. The 0xff byte is not valid UTF-8: history
-    // files hold arbitrary bytes, and the lossy decode has to get past it
-    // and leave the parser to reject the record on its own terms.
+    // message has to carry its path. These rendered strings are the
+    // user-facing surface: app prints them verbatim after "padloper: ".
+    // The 0xff byte is not valid UTF-8: history files hold arbitrary bytes,
+    // and the lossy decode has to get past it and leave the parser to
+    // reject the record on its own terms.
     #[test]
     fn text_reader_reports_read_and_format_errors() {
         let dir = tempfile::tempdir().expect("temp dir");
         let missing = dir.path().join("missing");
-        assert!(matches!(
-            read_text(&missing, Format::Detect),
-            Err(ImportError::Read { path, .. }) if path == missing
-        ));
+        let error = read_text(&missing, Format::Detect)
+            .err()
+            .expect("missing must fail");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.starts_with(&format!("cannot read {}: ", missing.display())),
+            "rendered was: {rendered}"
+        );
 
         let malformed = dir.path().join("fish_history");
         std::fs::write(&malformed, b"- cmd: bad\\q\xff\n").expect("write history");
-        assert!(matches!(
-            read_text(&malformed, Format::Fish),
-            Err(ImportError::Format { path, .. }) if path == malformed
-        ));
+        let error = read_text(&malformed, Format::Fish)
+            .err()
+            .expect("malformed must fail");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "cannot parse {}: line 1 has an unsupported Fish escape",
+                malformed.display()
+            )
+        );
     }
 
     // Rows are inserted out of order to prove the query sorts by timestamp,
@@ -611,9 +540,14 @@ mod tests {
 
         let malformed = dir.path().join("malformed.db");
         Connection::open(&malformed).expect("open malformed");
-        assert!(matches!(
-            read_atuin(&malformed),
-            Err(ImportError::Atuin { path, .. }) if path == malformed
-        ));
+        let error = read_atuin(&malformed).err().expect("malformed must fail");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.starts_with(&format!(
+                "cannot read the atuin db at {}: ",
+                malformed.display()
+            )),
+            "rendered was: {rendered}"
+        );
     }
 }

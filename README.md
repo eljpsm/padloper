@@ -101,7 +101,7 @@ History lives in `$XDG_DATA_HOME/padloper/history.db`, or
 
 ## Acknowledgements
 
-passdown is inspired by:
+padloper is inspired by:
 
 - [atuin](https://github.com/atuinsh/atuin)
 - [stinkpot](https://tangled.org/oppi.li/stinkpot)

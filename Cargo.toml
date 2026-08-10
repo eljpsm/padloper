@@ -5,17 +5,28 @@ edition = "2024"
 # Floor set by edition 2024.
 rust-version = "1.85"
 license = "GPL-3.0-or-later"
+autolib = false
 publish = false
 description = "A minimalist sqlite-backed shell-history recorder and searcher."
 repository = "https://github.com/eljpsm/padloper"
 
 [dependencies]
+anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 nucleo-matcher = "0.3"
 rusqlite = { version = "0.37", features = ["bundled"] }
-unicode-segmentation = "1.13"
+unicode-segmentation = "1"
 unicode-width = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+
+[profile.release]
+strip = true
+lto = true
+
+# Make plain `cargo clippy` and rust-analyzer as strict as CI. Clippy lints
+# do not run under `cargo build`, so toolchain bumps cannot break `nix build`.
+[lints.clippy]
+all = "deny"

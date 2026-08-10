@@ -1,7 +1,8 @@
 //! Subcommand dispatch. The one place errors are rendered.
 //!
-//! Every fallible step returns `Result<_, String>` and is printed here, so
-//! the modules below never write to stderr and never decide an exit code.
+//! Every fallible step returns `anyhow::Result` and its message is printed
+//! here, prefixed once, so the modules below never write to stderr and never
+//! decide an exit code.
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -15,14 +16,14 @@ use crate::{db, import, tui};
 pub fn run(cli: Cli) -> ExitCode {
     match execute(cli.command) {
         Ok(status) => status,
-        Err(message) => {
-            eprintln!("padloper: {message}");
+        Err(err) => {
+            eprintln!("padloper: {err:#}");
             ExitCode::FAILURE
         }
     }
 }
 
-fn execute(command: Command) -> Result<ExitCode, String> {
+fn execute(command: Command) -> anyhow::Result<ExitCode> {
     match command {
         Command::Init { shell } => {
             print!("{}", shell.snippet());
@@ -35,18 +36,18 @@ fn execute(command: Command) -> Result<ExitCode, String> {
     }
 }
 
-fn success(result: Result<(), String>) -> Result<ExitCode, String> {
+fn success(result: anyhow::Result<()>) -> anyhow::Result<ExitCode> {
     result.map(|()| ExitCode::SUCCESS)
 }
 
 /// Record one command. Runs on every prompt, so it must stay quiet and
 /// cheap; a bare Enter reaches here as an empty command and records nothing.
-fn add(exit: i32, cmd: &str) -> Result<(), String> {
+fn add(exit: i32, cmd: &str) -> anyhow::Result<()> {
     let cmd = cmd.trim();
     if cmd.is_empty() {
         return Ok(());
     }
-    let db = db::open().map_err(|e| e.to_string())?;
+    let db = db::open()?;
     let cwd = current_dir_string();
     let session = std::env::var("PADLOPER_SESSION").ok();
     db.observe(db::Observation {
@@ -56,17 +57,16 @@ fn add(exit: i32, cmd: &str) -> Result<(), String> {
         ts: unix_now(),
         session,
     })
-    .map_err(|e| e.to_string())
 }
 
 /// Load history, run the picker, and hand the outcome to the shell widget.
-fn search(initial_query: &str) -> Result<ExitCode, String> {
-    let db = db::open().map_err(|e| e.to_string())?;
+fn search(initial_query: &str) -> anyhow::Result<ExitCode> {
+    let db = db::open()?;
     // A bounded read keeps startup flat on a large db. Fuzzy matching runs
     // over every row on each keystroke, so this is also the latency budget.
-    let rows = db.recent(10000).map_err(|e| e.to_string())?;
-    let outcome = tui::run(rows, initial_query, current_dir_string()).map_err(|e| e.to_string())?;
-    emit_search(outcome, std::io::stdout().lock()).map_err(|e| e.to_string())
+    let rows = db.recent(10000)?;
+    let outcome = tui::run(rows, initial_query, current_dir_string())?;
+    Ok(emit_search(outcome, std::io::stdout().lock())?)
 }
 
 /// The recorder's cwd and the picker's dir-only scope must agree, so both
@@ -100,11 +100,11 @@ fn emit_search(outcome: tui::Outcome, mut out: impl Write) -> std::io::Result<Ex
 /// Print recent history as time, exit, and cmd, tab separated. Multiline
 /// commands print their newlines, so a consumer that splits on lines sees
 /// more rows than it asked for.
-fn list() -> Result<(), String> {
-    let db = db::open().map_err(|e| e.to_string())?;
+fn list() -> anyhow::Result<()> {
+    let db = db::open()?;
     let now = unix_now();
     let mut out = std::io::stdout().lock();
-    write_list(db.list().map_err(|e| e.to_string())?, now, &mut out);
+    write_list(db.list()?, now, &mut out);
     Ok(())
 }
 
@@ -120,9 +120,9 @@ fn write_list(rows: impl IntoIterator<Item = db::ListRow>, now: i64, mut out: im
     }
 }
 
-fn import() -> Result<(), String> {
-    let mut db = db::open().map_err(|e| e.to_string())?;
-    let count = import::run(&mut db).map_err(|e| e.to_string())?;
+fn import() -> anyhow::Result<()> {
+    let mut db = db::open()?;
+    let count = import::run(&mut db)?;
     println!("imported {count} commands");
     Ok(())
 }

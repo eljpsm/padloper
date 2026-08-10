@@ -7,10 +7,10 @@
 //! answer "how often" or "where else did I run this".
 
 use std::ffi::OsString;
-use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use anyhow::{Context, bail};
 use rusqlite::{Connection, params};
 
 // `unique` on cmd is what makes the row a projection rather than a log; the
@@ -64,36 +64,9 @@ pub struct Observation {
     pub session: Option<String>,
 }
 
-#[derive(Debug)]
-pub enum DbError {
-    /// No data directory to put the db in.
-    NoHome,
-    /// The file could not be created, opened, or brought up to schema.
-    Open { path: PathBuf, message: String },
-    /// A statement failed against an open db.
-    Query(String),
-}
-
-impl fmt::Display for DbError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            DbError::NoHome => {
-                write!(
-                    f,
-                    "cannot locate the data directory: XDG_DATA_HOME and HOME are unset"
-                )
-            }
-            DbError::Open { path, message } => {
-                write!(f, "cannot open {}: {message}", path.display())
-            }
-            DbError::Query(message) => write!(f, "database error: {message}"),
-        }
-    }
-}
-
 /// The XDG data root, `~/.local/share` by default. The import source search
 /// uses this too, so atuin and fish history are found the same way.
-pub(crate) fn data_dir() -> Result<PathBuf, DbError> {
+pub(crate) fn data_dir() -> anyhow::Result<PathBuf> {
     data_dir_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
 }
 
@@ -102,18 +75,18 @@ pub(crate) fn data_dir() -> Result<PathBuf, DbError> {
 ///
 /// An empty variable counts as unset, which is what an exported but
 /// never-assigned `HISTFILE` or `XDG_DATA_HOME` looks like.
-fn data_dir_from(xdg: Option<OsString>, home: Option<OsString>) -> Result<PathBuf, DbError> {
+fn data_dir_from(xdg: Option<OsString>, home: Option<OsString>) -> anyhow::Result<PathBuf> {
     if let Some(dir) = xdg.filter(|dir| !dir.is_empty()) {
         return Ok(PathBuf::from(dir));
     }
     match home {
         Some(home) if !home.is_empty() => Ok(PathBuf::from(home).join(".local").join("share")),
-        _ => Err(DbError::NoHome),
+        _ => bail!("cannot locate the data directory: XDG_DATA_HOME and HOME are unset"),
     }
 }
 
 /// Open the real history db, creating it on first use.
-pub fn open() -> Result<Db, DbError> {
+pub fn open() -> anyhow::Result<Db> {
     let path = data_dir()?.join("padloper").join("history.db");
     Db::open_at(&path)
 }
@@ -125,44 +98,39 @@ impl Db {
     /// WAL and the busy timeout are what let a prompt hook write while a
     /// picker in another terminal reads. Without them a concurrent write
     /// fails instead of waiting.
-    pub(crate) fn open_at(path: &Path) -> Result<Db, DbError> {
-        let open_err = |message: String| DbError::Open {
-            path: path.to_path_buf(),
-            message,
-        };
+    pub(crate) fn open_at(path: &Path) -> anyhow::Result<Db> {
+        let open_context = || format!("cannot open {}", path.display());
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| open_err(e.to_string()))?;
+            std::fs::create_dir_all(parent).with_context(open_context)?;
         }
-        let conn = Connection::open(path).map_err(|e| open_err(e.to_string()))?;
+        let conn = Connection::open(path).with_context(open_context)?;
         conn.busy_timeout(Duration::from_millis(5000))
-            .map_err(|e| open_err(e.to_string()))?;
+            .with_context(open_context)?;
         conn.pragma_update(None, "journal_mode", "wal")
-            .map_err(|e| open_err(e.to_string()))?;
-        conn.execute_batch(SCHEMA)
-            .map_err(|e| open_err(e.to_string()))?;
+            .with_context(open_context)?;
+        conn.execute_batch(SCHEMA).with_context(open_context)?;
         Ok(Db { conn })
     }
 
     /// Record one command. Inserts, or refreshes the existing row under the
     /// rules in [`OBSERVE`].
-    pub fn observe(&self, row: Observation) -> Result<(), DbError> {
+    pub fn observe(&self, row: Observation) -> anyhow::Result<()> {
         self.conn
             .execute(
                 OBSERVE,
                 params![row.cmd, row.cwd, row.exit, row.ts, row.session],
             )
-            .map_err(|e| DbError::Query(e.to_string()))?;
+            .context("database error")?;
         Ok(())
     }
 
     /// The newest `limit` commands, newest first. The picker relies on that
     /// order for its tiebreak, so do not reorder here.
-    pub fn recent(&self, limit: usize) -> Result<Vec<HistoryRow>, DbError> {
-        let query_err = |e: rusqlite::Error| DbError::Query(e.to_string());
+    pub fn recent(&self, limit: usize) -> anyhow::Result<Vec<HistoryRow>> {
         let mut stmt = self
             .conn
             .prepare("select cmd, ts, cwd from history order by ts desc, id desc limit ?1")
-            .map_err(query_err)?;
+            .context("database error")?;
         let rows = stmt
             .query_map([limit as i64], |r| {
                 Ok(HistoryRow {
@@ -171,17 +139,17 @@ impl Db {
                     cwd: r.get(2)?,
                 })
             })
-            .map_err(query_err)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(query_err)
+            .context("database error")?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .context("database error")
     }
 
     /// The 50 newest commands, newest first, for `padloper list`.
-    pub fn list(&self) -> Result<Vec<ListRow>, DbError> {
-        let query_err = |e: rusqlite::Error| DbError::Query(e.to_string());
+    pub fn list(&self) -> anyhow::Result<Vec<ListRow>> {
         let mut stmt = self
             .conn
             .prepare("select ts, exit, cmd from history order by ts desc, id desc limit 50")
-            .map_err(query_err)?;
+            .context("database error")?;
         let rows = stmt
             .query_map([], |r| {
                 Ok(ListRow {
@@ -190,8 +158,9 @@ impl Db {
                     cmd: r.get(2)?,
                 })
             })
-            .map_err(query_err)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(query_err)
+            .context("database error")?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .context("database error")
     }
 
     /// Record many commands in one transaction, the shape import needs: a
@@ -199,26 +168,25 @@ impl Db {
     ///
     /// Returns how many rows were written, which is not the row count of the
     /// db. Blank commands are skipped, and repeats collapse onto one row.
-    pub fn observe_all<I>(&mut self, rows: I) -> Result<u64, DbError>
+    pub fn observe_all<I>(&mut self, rows: I) -> anyhow::Result<u64>
     where
         I: IntoIterator<Item = Observation>,
     {
-        let query_err = |e: rusqlite::Error| DbError::Query(e.to_string());
-        let tx = self.conn.transaction().map_err(query_err)?;
+        let tx = self.conn.transaction().context("database error")?;
         let mut count = 0u64;
         {
-            let mut stmt = tx.prepare(OBSERVE).map_err(query_err)?;
+            let mut stmt = tx.prepare(OBSERVE).context("database error")?;
             for row in rows {
                 let cmd = row.cmd.trim();
                 if cmd.is_empty() {
                     continue;
                 }
                 stmt.execute(params![cmd, row.cwd, row.exit, row.ts, row.session])
-                    .map_err(query_err)?;
+                    .context("database error")?;
                 count += 1;
             }
         }
-        tx.commit().map_err(query_err)?;
+        tx.commit().context("database error")?;
         Ok(count)
     }
 }
@@ -255,6 +223,9 @@ mod tests {
         (dir, db)
     }
 
+    // The error strings here and below are the user-facing surface: app
+    // prints them verbatim after "padloper: ". Each has to say what failed
+    // and where.
     #[test]
     fn data_directory_prefers_xdg_then_falls_back_to_home() {
         assert_eq!(
@@ -266,33 +237,12 @@ mod tests {
             data_dir_from(Some(OsString::new()), Some(OsString::from("/home"))).expect("home"),
             PathBuf::from("/home/.local/share")
         );
-        assert!(matches!(data_dir_from(None, None), Err(DbError::NoHome)));
-        assert!(matches!(
-            data_dir_from(None, Some(OsString::new())),
-            Err(DbError::NoHome)
-        ));
-    }
-
-    // These strings are the user-facing surface: app prints them verbatim
-    // after "padloper: ". Each has to say what failed and where.
-    #[test]
-    fn database_errors_name_the_operation_and_path() {
+        let error = data_dir_from(None, None).expect_err("no home");
         assert_eq!(
-            DbError::NoHome.to_string(),
+            error.to_string(),
             "cannot locate the data directory: XDG_DATA_HOME and HOME are unset"
         );
-        assert_eq!(
-            DbError::Open {
-                path: PathBuf::from("/tmp/history.db"),
-                message: "bad file".into(),
-            }
-            .to_string(),
-            "cannot open /tmp/history.db: bad file"
-        );
-        assert_eq!(
-            DbError::Query("bad query".into()).to_string(),
-            "database error: bad query"
-        );
+        assert!(data_dir_from(None, Some(OsString::new())).is_err());
     }
 
     // A file where a directory should be, so create_dir_all fails. The
@@ -306,7 +256,11 @@ mod tests {
 
         let error = Db::open_at(&path).err().expect("open must fail");
 
-        assert!(matches!(error, DbError::Open { path: p, .. } if p == path));
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.starts_with(&format!("cannot open {}: ", path.display())),
+            "rendered was: {rendered}"
+        );
     }
 
     // `create table if not exists` accepts any existing table by that name,
@@ -321,7 +275,8 @@ mod tests {
             .expect("seed schema");
         drop(conn);
 
-        assert!(matches!(Db::open_at(&path), Err(DbError::Open { .. })));
+        let error = Db::open_at(&path).err().expect("open must fail");
+        assert!(format!("{error:#}").starts_with("cannot open "));
     }
 
     // Every subcommand opens the db, so the schema has to apply to an
@@ -448,7 +403,11 @@ mod tests {
             ])
             .expect_err("batch must fail");
 
-        assert!(matches!(error, DbError::Query(_)));
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.starts_with("database error: "),
+            "rendered was: {rendered}"
+        );
         assert!(db.list().expect("list").is_empty());
     }
 
@@ -462,16 +421,18 @@ mod tests {
             .execute_batch("drop table history;")
             .expect("drop schema");
 
-        assert!(matches!(
-            db.observe(observation("ls", None, None, 100, None)),
-            Err(DbError::Query(_))
-        ));
-        assert!(matches!(db.recent(10), Err(DbError::Query(_))));
-        assert!(matches!(db.list(), Err(DbError::Query(_))));
-        assert!(matches!(
-            db.observe_all([observation("ls", None, None, 100, None)]),
-            Err(DbError::Query(_))
-        ));
+        let is_query_error =
+            |error: anyhow::Error| format!("{error:#}").starts_with("database error: ");
+        assert!(
+            db.observe(observation("ls", None, None, 100, None))
+                .is_err_and(is_query_error)
+        );
+        assert!(db.recent(10).is_err_and(is_query_error));
+        assert!(db.list().is_err_and(is_query_error));
+        assert!(
+            db.observe_all([observation("ls", None, None, 100, None)])
+                .is_err_and(is_query_error)
+        );
     }
 
     // 51 rows for a 50 row cap, so the test also shows which end is
