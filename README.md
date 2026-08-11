@@ -70,31 +70,36 @@ The first selected source wins. A read or parse error stops the import instead
 of falling through to another source.
 
 ```mermaid
-flowchart TD
+flowchart LR
     Start["padloper import"] --> Atuin{"Atuin database exists?"}
     Atuin -- Yes --> ReadAtuin["Read Atuin database"]
     Atuin -- No --> Histfile{"HISTFILE is set?"}
-
     Histfile -- Yes --> ReadHistfile["Read HISTFILE"]
-    ReadHistfile --> Detect{"First nonblank line"}
-    Detect -- "Fish marker" --> Fish["Parse Fish history"]
-    Detect -- "Zsh header" --> Zsh["Parse Zsh extended history"]
-    Detect -- "Anything else" --> Bash["Parse Bash history"]
-
     Histfile -- No --> Shell{"SHELL basename"}
     Shell -- fish --> FishFile{"Fish history exists?"}
-    FishFile -- Yes --> Fish
-    FishFile -- No --> NoSource["Stop: no source"]
-    Shell -- zsh --> NoSource
+    FishFile -- Yes --> ReadFish["Read Fish history"]
     Shell -- "bash, unset, or other" --> BashFile{".bash_history exists?"}
-    BashFile -- Yes --> Bash
-    BashFile -- No --> NoSource
+    BashFile -- Yes --> ReadBash["Read .bash_history"]
 
     ReadAtuin --> Finish["Sort oldest first and merge into padloper"]
-    Fish --> Finish
-    Zsh --> Finish
-    Bash --> Finish
+    ReadHistfile --> Finish
+    ReadFish --> Finish
+    ReadBash --> Finish
+
+    Shell -- zsh --> NoSource["Stop: no source"]
+    FishFile -- No --> NoSource
+    BashFile -- No --> NoSource
 ```
+
+A file picked from `SHELL` is parsed as that shell wrote it. HISTFILE says
+nothing about which shell wrote it, so its format comes from the first nonblank
+line:
+
+| First nonblank line     | Parsed as    |
+| ----------------------- | ------------ |
+| Starts with ` - cmd:  ` | Fish         |
+| A Zsh extended header   | Zsh extended |
+| Anything else           | Bash         |
 
 History lives in `$XDG_DATA_HOME/padloper/history.db`, or
 `~/.local/share/padloper/history.db`.
