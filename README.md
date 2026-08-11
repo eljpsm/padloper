@@ -17,6 +17,9 @@ nix run github:eljpsm/padloper
 make install
 ```
 
+Prebuilt Linux binaries are on the [releases
+page](https://github.com/eljpsm/padloper/releases).
+
 ## Usage
 
 Add to your shell config:
